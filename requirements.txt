@@ -3,3 +3,5 @@ requests
 flask-limiter
 loguru
 flask-httpauth
+flask-dotenv
+sqlite3
