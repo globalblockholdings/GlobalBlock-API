@@ -5,3 +5,4 @@ loguru
 flask-httpauth
 flask-dotenv
 sqlite3
+flask-cors
