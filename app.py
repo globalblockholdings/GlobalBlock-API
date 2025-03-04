@@ -1,62 +1,91 @@
-from dotenv import load_dotenv
 import os
-import requests
+import secrets
+import stripe
 import sqlite3
-import sys
-from flask import Flask, jsonify, request
+import requests
+import hashlib
+import logging
+from flask import Flask, request, jsonify
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from flask_httpauth import HTTPTokenAuth
-from loguru import logger
+from web3 import Web3
+from dotenv import load_dotenv
 from flask_cors import CORS
+from cryptography.fernet import Fernet
+import threading
+import time
+from flask_socketio import SocketIO
 
 # Load environment variables
 load_dotenv()
-
-# Get Alchemy API Key from .env
-ALCHEMY_API_KEY = os.getenv("ALCHEMY_API_KEY")
-if not ALCHEMY_API_KEY:
-    raise ValueError("Missing ALCHEMY_API_KEY in environment variables.")
-
-ALCHEMY_URL = f"https://eth-mainnet.alchemyapi.io/v2/{ALCHEMY_API_KEY}"
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+cipher = Fernet(ENCRYPTION_KEY.encode())
 
 # Initialize Flask app
 app = Flask(__name__)
-CORS(app)  # Enable Cross-Origin Resource Sharing
+socketio = SocketIO(app)
+CORS(app, resources={r"/*": {"origins": ["https://dashboard.globalblock-api.com"]}})
 
 # Configure logging
-logger.remove()
-logger.add(sys.stderr, format="{time} {level} {message}", level="INFO")
-logger.add("api_logs.log", rotation="10 MB", level="INFO")
-logger.info("Logging system initialized.")
+logging.basicConfig(
+    filename="api_activity.log",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s")
 
-# Set up rate limiting
-limiter = Limiter(
-    get_remote_address,
-    app=app,
-    default_limits=["100 per hour"],
-)
+# Configure Stripe API
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
-# Token-based authentication
-auth = HTTPTokenAuth(scheme="Bearer")
+# Configure Web3
+ALCHEMY_API_URL = os.getenv("ALCHEMY_API_URL")
+PAYMENT_WALLET_ADDRESS = os.getenv("CRYPTO_WALLET")
 
-# Database connection function
+# Secure API Key Storage
+def encrypt_key(api_key):
+    return cipher.encrypt(api_key.encode()).decode()
+
+def decrypt_key(encrypted_key):
+    return cipher.decrypt(encrypted_key.encode()).decode()
+
+# Database Connection
 def get_db_connection():
     conn = sqlite3.connect("api_keys.db")
     conn.row_factory = sqlite3.Row
     return conn
 
-# Verify API key from the database
-@auth.verify_token
-def verify_token(token):
+# Set up Rate Limiting
+limiter = Limiter(get_remote_address, app=app, default_limits=["10 per minute"])
+
+@app.before_request
+def apply_rate_limit():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT name FROM users WHERE api_key = ?", (token,))
+    user_plan = cursor.execute("SELECT plan FROM users WHERE api_key = ?", 
+                               (request.headers.get("Authorization"),)).fetchone()
+    conn.close()
+    limits = {"free": "10 per minute", "pro": "100 per minute", "enterprise": "1000 per minute"}
+    user_plan = user_plan[0] if user_plan else "free"
+    limiter.limit(limits.get(user_plan, "10 per minute"))
+
+# Token-based authentication
+auth = HTTPTokenAuth(scheme="Bearer")
+
+@auth.verify_token
+def verify_token(token):
+    hashed_token = hashlib.sha256(token.encode()).hexdigest()
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT name FROM users WHERE api_key = ?", (hashed_token,))
     user = cursor.fetchone()
     conn.close()
     return user["name"] if user else None
 
-# Get Ethereum transaction details
+# WebSockets for Real-time Notifications
+@socketio.on('connect')
+def handle_connect():
+    logging.info("Client connected to WebSocket.")
+
+# API Endpoints
 @app.route('/get_tx_details', methods=['GET'])
 @auth.login_required
 @limiter.limit("10 per minute")
@@ -64,99 +93,48 @@ def get_tx_details():
     tx_hash = request.args.get('tx_hash')
     if not tx_hash:
         return jsonify({"error": "Transaction hash is required"}), 400
+    response = requests.post(ALCHEMY_API_URL, json={
+        "jsonrpc": "2.0",
+        "method": "eth_getTransactionByHash",
+        "params": [tx_hash],
+        "id": 1
+    })
+    if response.status_code != 200:
+        return jsonify({"error": "Failed to retrieve data"}), response.status_code
+    return jsonify(response.json())
 
-    try:
-        response = requests.post(
-            ALCHEMY_URL,
-            json={
-                "jsonrpc": "2.0",
-                "method": "eth_getTransactionByHash",
-                "params": [tx_hash],
-                "id": 1
-            },
-            timeout=10  # Prevent long wait times
-        )
-
-        if response.status_code != 200:
-            logger.error(f"Alchemy API error: {response.text}")
-            return jsonify({"error": "Alchemy API error"}), response.status_code
-
-        result = response.json()
-
-        if 'result' in result and result['result']:
-            return jsonify(result['result'])
-        else:
-            return jsonify({"error": "Transaction not found or invalid hash"}), 404
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Request timed out"}), 504
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        return jsonify({"error": "Internal server error"}), 500
-
-# Get Gas Fee Estimates
-@app.route('/get_gas_fees', methods=['GET'])
+# AI-Powered Blockchain Query Engine (Web3 Search API)
+@app.route('/query_blockchain', methods=['POST'])
 @auth.login_required
-def get_gas_fees():
-    try:
-        response = requests.post(
-            ALCHEMY_URL,
-            json={"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1},
-            timeout=10
-        )
-        result = response.json()
-        return jsonify({"gas_price": result.get("result")})
-    except Exception as e:
-        logger.error(f"Gas Fee API error: {str(e)}")
-        return jsonify({"error": "Failed to fetch gas fees"}), 500
+@limiter.limit("10 per minute")
+def query_blockchain():
+    query = request.json.get("query")
+    if not query:
+        return jsonify({"error": "Query is required"}), 400
+    
+    # Simulated AI processing of query (replace with actual AI logic)
+    ai_response = f"AI-processed blockchain data for query: {query}"
+    
+    return jsonify({"query_result": ai_response})
 
-# Decode Smart Contract Interaction
-@app.route('/decode_contract', methods=['POST'])
+# Dynamic Rate Limiting
+@app.route('/dynamic_rate_limit', methods=['GET'])
 @auth.login_required
-def decode_contract():
-    data = request.json
-    contract_address = data.get('contract_address')
-    function_data = data.get('function_data')
+def dynamic_rate_limit():
+    api_key = request.headers.get("Authorization")
+    user_plan = get_user_plan(api_key)
+    return jsonify({"rate_limit": f"{user_plan} requests per minute"})
 
-    if not contract_address or not function_data:
-        return jsonify({"error": "Missing contract address or function data"}), 400
-
-    try:
-        response = requests.post(
-            ALCHEMY_URL,
-            json={
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{"to": contract_address, "data": function_data}, "latest"],
-                "id": 1
-            },
-            timeout=10
-        )
-        return jsonify(response.json())
-    except Exception as e:
-        logger.error(f"Contract decoding error: {str(e)}")
-        return jsonify({"error": "Failed to decode contract interaction"}), 500
-
-# Get NFT Metadata
-@app.route('/get_nft_metadata', methods=['GET'])
-@auth.login_required
-def get_nft_metadata():
-    token_address = request.args.get('token_address')
-    token_id = request.args.get('token_id')
-    if not token_address or not token_id:
-        return jsonify({"error": "Missing token address or token ID"}), 400
-
-    url = f"https://api.opensea.io/api/v1/asset/{token_address}/{token_id}"
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code != 200:
-            return jsonify({"error": "Failed to fetch NFT metadata"}), 502
-        return jsonify(response.json())
-    except requests.exceptions.Timeout:
-        return jsonify({"error": "Request to OpenSea API timed out"}), 504
-    except Exception as e:
-        logger.error(f"NFT Metadata API error: {str(e)}")
-        return jsonify({"error": "Failed to fetch NFT metadata"}), 500
+# Activate API Access
+def activate_api_access(email, plan):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    hashed_key = hashlib.sha256(secrets.token_hex(16).encode()).hexdigest()
+    encrypted_key = encrypt_key(hashed_key)
+    cursor.execute("UPDATE users SET plan = ?, api_key = ? WHERE email = ?", (plan, encrypted_key, email))
+    conn.commit()
+    conn.close()
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=10000, debug=False)
-    
+    debug_mode = os.getenv("DEBUG_MODE", "False").lower() == "true"
+    socketio.run(app, host="0.0.0.0", port=10000, debug=debug_mode)
