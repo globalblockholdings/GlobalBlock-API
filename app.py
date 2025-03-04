@@ -16,6 +16,7 @@ from cryptography.fernet import Fernet
 import threading
 import time
 from flask_socketio import SocketIO
+from redis import Redis
 
 # Load environment variables
 load_dotenv()
@@ -26,6 +27,15 @@ cipher = Fernet(ENCRYPTION_KEY.encode())
 app = Flask(__name__)
 socketio = SocketIO(app)
 CORS(app, resources={r"/*": {"origins": ["https://dashboard.globalblock-api.com"]}})
+
+# Initialize Redis for Rate Limiting
+redis_client = Redis(host="localhost", port=6379, db=0)  # Update if using cloud Redis
+
+# Apply Redis-based rate limiting
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    storage_uri="redis://localhost:6379"")
 
 # Configure logging
 logging.basicConfig(
@@ -52,9 +62,6 @@ def get_db_connection():
     conn = sqlite3.connect("api_keys.db")
     conn.row_factory = sqlite3.Row
     return conn
-
-# Set up Rate Limiting
-limiter = Limiter(get_remote_address, app=app, default_limits=["10 per minute"])
 
 @app.before_request
 def apply_rate_limit():
@@ -102,20 +109,6 @@ def get_tx_details():
     if response.status_code != 200:
         return jsonify({"error": "Failed to retrieve data"}), response.status_code
     return jsonify(response.json())
-
-# AI-Powered Blockchain Query Engine (Web3 Search API)
-@app.route('/query_blockchain', methods=['POST'])
-@auth.login_required
-@limiter.limit("10 per minute")
-def query_blockchain():
-    query = request.json.get("query")
-    if not query:
-        return jsonify({"error": "Query is required"}), 400
-    
-    # Simulated AI processing of query (replace with actual AI logic)
-    ai_response = f"AI-processed blockchain data for query: {query}"
-    
-    return jsonify({"query_result": ai_response})
 
 # Dynamic Rate Limiting
 @app.route('/dynamic_rate_limit', methods=['GET'])
